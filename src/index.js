@@ -48,7 +48,7 @@ app.post("/generateSignature", (req, res) => {
   const payload = {
     app_key: process.env.ZOOM_SDK_KEY,
     tpc: sessionName,
-    role_type: 1,
+    role_type: role,
     version: 1,
     iat,
     exp,
