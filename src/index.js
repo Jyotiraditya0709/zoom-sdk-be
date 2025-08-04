@@ -70,25 +70,54 @@ app.post("/webhook/zoom", async (req, res) => {
   // Handle Zoom webhook validation
   if (event === "endpoint.url_validation") {
     console.log("🔐 Handling webhook validation...");
+    console.log("📝 Validation payload:", JSON.stringify(req.body, null, 2));
 
     const crypto = require("crypto");
-    const plainToken = payload.plainToken;
+    const plainToken = payload?.plainToken;
 
-    // You'll need to add ZOOM_WEBHOOK_SECRET_TOKEN to your .env file
-    const webhookSecret =
-      process.env.ZOOM_WEBHOOK_SECRET_TOKEN || "your_webhook_secret_here";
+    if (!plainToken) {
+      console.error("❌ No plainToken in validation request");
+      return res.status(400).json({
+        error: "Missing plainToken in validation request",
+      });
+    }
+
+    // Check if webhook secret is configured
+    const webhookSecret = process.env.ZOOM_WEBHOOK_SECRET_TOKEN;
+
+    if (!webhookSecret) {
+      console.error("❌ ZOOM_WEBHOOK_SECRET_TOKEN not configured");
+      return res.status(500).json({
+        error: "Webhook secret not configured",
+        message:
+          "Please add ZOOM_WEBHOOK_SECRET_TOKEN to environment variables",
+      });
+    }
+
+    console.log(
+      "🔑 Using webhook secret:",
+      webhookSecret.substring(0, 4) + "..."
+    );
+    console.log("📝 Plain token:", plainToken);
 
     const hashForValidate = crypto
       .createHmac("sha256", webhookSecret)
       .update(plainToken)
       .digest("hex");
 
-    console.log("✅ Webhook validation response sent");
+    console.log("🔐 Generated hash:", hashForValidate);
 
-    return res.status(200).json({
+    const response = {
       plainToken: plainToken,
       encryptedToken: hashForValidate,
-    });
+    };
+
+    console.log(
+      "✅ Webhook validation response:",
+      JSON.stringify(response, null, 2)
+    );
+
+    return res.status(200).json(response);
   }
 
   if (event === "session.recording_completed") {
