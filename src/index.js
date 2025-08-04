@@ -40,6 +40,15 @@ app.get("/", (req, res) => {
       queueStats: `/queue/stats`,
       recordings: `/recordings`,
     },
+    env: {
+      hasWebhookSecret: !!process.env.ZOOM_WEBHOOK_SECRET_TOKEN,
+      webhookSecretLength: process.env.ZOOM_WEBHOOK_SECRET_TOKEN
+        ? process.env.ZOOM_WEBHOOK_SECRET_TOKEN.length
+        : 0,
+      webhookSecretStart: process.env.ZOOM_WEBHOOK_SECRET_TOKEN
+        ? process.env.ZOOM_WEBHOOK_SECRET_TOKEN.substring(0, 4)
+        : "NOT_SET",
+    },
   });
 });
 
@@ -72,7 +81,7 @@ app.post("/webhook/zoom", async (req, res) => {
     console.log("🔐 Handling webhook validation...");
     console.log("📝 Validation payload:", JSON.stringify(req.body, null, 2));
 
-    const crypto = require("crypto");
+    const crypto = await import("crypto");
     const plainToken = payload?.plainToken;
 
     if (!plainToken) {
@@ -100,7 +109,7 @@ app.post("/webhook/zoom", async (req, res) => {
     );
     console.log("📝 Plain token:", plainToken);
 
-    const hashForValidate = crypto
+    const hashForValidate = crypto.default
       .createHmac("sha256", webhookSecret)
       .update(plainToken)
       .digest("hex");
