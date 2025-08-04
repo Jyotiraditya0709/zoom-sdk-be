@@ -67,6 +67,30 @@ app.post("/webhook/zoom", async (req, res) => {
 
   console.log("🎯 ZOOM WEBHOOK RECEIVED:", event);
 
+  // Handle Zoom webhook validation
+  if (event === "endpoint.url_validation") {
+    console.log("🔐 Handling webhook validation...");
+
+    const crypto = require("crypto");
+    const plainToken = payload.plainToken;
+
+    // You'll need to add ZOOM_WEBHOOK_SECRET_TOKEN to your .env file
+    const webhookSecret =
+      process.env.ZOOM_WEBHOOK_SECRET_TOKEN || "your_webhook_secret_here";
+
+    const hashForValidate = crypto
+      .createHmac("sha256", webhookSecret)
+      .update(plainToken)
+      .digest("hex");
+
+    console.log("✅ Webhook validation response sent");
+
+    return res.status(200).json({
+      plainToken: plainToken,
+      encryptedToken: hashForValidate,
+    });
+  }
+
   if (event === "session.recording_completed") {
     const sessionId = payload?.object?.session_id;
     const files = payload?.object?.recording_files || [];
