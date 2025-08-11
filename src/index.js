@@ -1,4 +1,4 @@
-import express from "express";
+import express, { application } from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { KJUR } from "jsrsasign";
@@ -10,13 +10,21 @@ import recordingQueue, {
   getQueueStats,
 } from "./queues/recordingQueue.js";
 import "./workers/recordingWorker.js";
+import apiRoutes from "./routes/api.js";
 
 dotenv.config();
 
 const app = express();
 const port = process.env.PORT || 4000;
 
-app.use(cors());
+app.use(
+  cors({
+    origin: ["http://localhost:3000", "http://127.0.0.1:3000"],
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+  })
+);
 app.use(express.json({ limit: "10mb" }));
 
 // Setup BullBoard dashboard
@@ -249,6 +257,29 @@ app.post("/generateSignature", (req, res) => {
     console.error("JWT signing failed:", err);
     return res.status(500).json({ error: "Internal server error" });
   }
+});
+// �� Add debug logging -- seeing this sitll remove this-jmishra
+app.use((req, res, next) => {
+  console.log(`🔍 ${req.method} ${req.path} - ${new Date().toISOString()}`);
+  next();
+});
+
+// routes
+app.use("/api", apiRoutes);
+
+app.use((req, res) => {
+  console.log(`❌ 404 Not Found: ${req.method} ${req.path}`);
+  res.status(404).json({
+    error: "Route not found",
+    method: req.method,
+    path: req.path,
+    availableRoutes: [
+      "GET /api/getMeetingInfo/:meetingId/:userId",
+      "POST /api/userJoined",
+      "POST /api/userLeft",
+      "GET /api/meetingState/:meetingId",
+    ],
+  });
 });
 
 app.listen(port, () => {
