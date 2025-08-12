@@ -1,5 +1,7 @@
 import { Worker } from "bullmq";
 import redisClient from "../config/redis.js";
+import { batchStreamUpload } from "../services/s3StreamingService.js";
+import ZoomMeeting from "../models/ZoomMeeting.js";
 
 const recordingWorker = new Worker(
   "zoom-recording-processing",
@@ -20,50 +22,103 @@ const recordingWorker = new Worker(
       const accountId = payload?.account_id;
 
       console.log(`📊 Processing recording for session: ${sessionId}`);
+      console.log(`📁 Found ${files.length} files to upload`);
 
-      const processedFiles = [];
+      // Validate required data
+      if (!sessionId) {
+        throw new Error("Session ID is required");
+      }
 
-      for (const file of files) {
-        console.log(`🔄 Processing file: ${file.id} (${file.recording_type})`);
+      if (!download_token) {
+        throw new Error("Download token is required");
+      }
 
-        const fileData = {
-          id: file.id,
-          type: file.recording_type,
-          name: file.file_name || `recording_${file.id}.mp4`,
-          size: file.file_size,
-          downloadUrl: file.download_url,
-          recordingStart: file.recording_start,
-          recordingEnd: file.recording_end,
-          duration: file.duration,
-          downloadToken: download_token,
+      if (files.length === 0) {
+        console.log(`⚠️ No files found for session: ${sessionId}`);
+        return {
           sessionId,
           accountId,
-          processedAt: new Date().toISOString(),
+          filesProcessed: 0,
+          message: "No files to process",
+          processingTime: new Date().toISOString(),
         };
+      }
 
-        console.log(`✅ File processed:`, {
-          id: fileData.id,
-          type: fileData.type,
-          size: fileData.size,
-          duration: fileData.duration,
-        });
+      // Upload files to S3 using streaming upload
+      console.log(`�� Starting S3 upload for session: ${sessionId}`);
 
-        processedFiles.push(fileData);
+      const uploadResult = await batchStreamUpload(
+        files,
+        sessionId,
+        download_token
+      );
 
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+      // Calculate summary statistics
+      const totalSize = uploadResult.successfulUploads.reduce((sum, file) => {
+        return sum + (parseInt(file.fileSize) || 0);
+      }, 0);
+
+      const totalDuration = uploadResult.successfulUploads.reduce(
+        (sum, file) => {
+          return sum + (parseInt(file.duration) || 0);
+        },
+        0
+      );
+
+      // 🆕 UPDATE DATABASE WITH S3 URL
+      if (uploadResult.successfulUploads.length > 0) {
+        try {
+          console.log(`💾 Updating database for session: ${sessionId}`);
+
+          // Find the meeting record
+          const meeting = await ZoomMeeting.findOne({
+            where: { sessionId: sessionId },
+          });
+
+          if (meeting) {
+            // Get the primary video recording URL (usually the first successful upload)
+            const primaryVideo =
+              uploadResult.successfulUploads.find(
+                (file) => file.recordingType === "video"
+              ) || uploadResult.successfulUploads[0];
+
+            // Update only the existing recordingUrl column
+            await meeting.update({
+              recordingUrl: primaryVideo.s3Url,
+            });
+
+            console.log(
+              `✅ Database updated with S3 URL: ${primaryVideo.s3Url}`
+            );
+          } else {
+            console.log(`⚠️ No meeting record found for session: ${sessionId}`);
+          }
+        } catch (dbError) {
+          console.error(`❌ Database update failed:`, dbError.message);
+          // Don't fail the entire job if database update fails
+        }
       }
 
       const result = {
         sessionId,
         accountId,
-        filesProcessed: processedFiles.length,
-        processedFiles,
-        totalSize: processedFiles.reduce((sum, file) => sum + file.size, 0),
-        totalDuration: processedFiles.reduce(
-          (sum, file) => sum + file.duration,
-          0
-        ),
+        filesProcessed: uploadResult.successfulUploads.length,
+        failedFiles: uploadResult.failedUploads.length,
+        totalFiles: uploadResult.totalFiles,
+        successfulUploads: uploadResult.successfulUploads.map((file) => ({
+          s3Url: file.s3Url,
+          s3Key: file.s3Key,
+          originalFileId: file.originalFileId,
+          recordingType: file.recordingType,
+          fileSize: file.fileSize,
+          duration: file.duration,
+        })),
+        failedUploads: uploadResult.failedUploads,
+        totalSize: totalSize,
+        totalDuration: totalDuration,
         processingTime: new Date().toISOString(),
+        uploadCompletedAt: uploadResult.completedAt,
+        databaseUpdated: uploadResult.successfulUploads.length > 0, // Add this line
       };
 
       console.log(
@@ -71,14 +126,39 @@ const recordingWorker = new Worker(
       );
       console.log(`📈 Summary:`, {
         filesProcessed: result.filesProcessed,
+        failedFiles: result.failedFiles,
         totalSize: `${(result.totalSize / 1024 / 1024).toFixed(2)} MB`,
         totalDuration: `${(result.totalDuration / 60).toFixed(2)} minutes`,
+        databaseUpdated: result.databaseUpdated,
       });
+
+      // Log successful uploads
+      if (result.successfulUploads.length > 0) {
+        console.log(`✅ Successfully uploaded files:`);
+        result.successfulUploads.forEach((file) => {
+          console.log(`   - ${file.recordingType}: ${file.s3Url}`);
+        });
+      }
+
+      // Log failed uploads
+      if (result.failedUploads.length > 0) {
+        console.log(`❌ Failed uploads:`);
+        result.failedUploads.forEach((failure) => {
+          console.log(`   - File ${failure.fileId}: ${failure.error}`);
+        });
+      }
 
       return result;
     } catch (error) {
       console.error(`❌ Error processing recording job ${job.id}:`, error);
-      throw error;
+
+      return {
+        error: true,
+        message: error.message,
+        stack: error.stack,
+        jobId: job.id,
+        timestamp: new Date().toISOString(),
+      };
     }
   },
   {
@@ -90,15 +170,22 @@ const recordingWorker = new Worker(
 );
 
 recordingWorker.on("ready", () => {
-  console.log("🚀 Recording worker is ready");
+  console.log("🚀 Recording worker is ready for S3 uploads");
 });
 
 recordingWorker.on("active", (job) => {
-  console.log(`🔄 Worker started job ${job.id}`);
+  console.log(`🔄 Worker started S3 upload job ${job.id}`);
 });
 
 recordingWorker.on("completed", (job, result) => {
-  console.log(`✅ Worker completed job ${job.id}`);
+  if (result.error) {
+    console.error(`❌ Worker failed job ${job.id}:`, result.message);
+  } else {
+    console.log(`✅ Worker completed S3 upload job ${job.id}`);
+    console.log(
+      `📊 Uploaded ${result.filesProcessed} files for session: ${result.sessionId}`
+    );
+  }
 });
 
 recordingWorker.on("failed", (job, err) => {
