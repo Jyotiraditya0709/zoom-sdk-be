@@ -1,7 +1,23 @@
 import { Worker } from "bullmq";
 import redisClient from "../config/redis.js";
 import { batchStreamUpload } from "../services/s3StreamingService.js";
-import ZoomMeeting from "../models/ZoomMeeting.js";
+import Sequelize from "sequelize";
+
+// Initialize Sequelize connection for the worker
+const sequelize = new Sequelize(
+  process.env.DB_NAME,
+  process.env.DB_USER,
+  process.env.DB_PASSWORD,
+  {
+    host: process.env.DB_HOST,
+    port: process.env.DB_PORT,
+    dialect: "mysql",
+  }
+);
+
+// Import and initialize the ZoomMeeting model
+const ZoomMeetingModel = (await import("../models/ZoomMeeting.js")).default;
+const ZoomMeeting = ZoomMeetingModel(sequelize, Sequelize.DataTypes);
 
 const recordingWorker = new Worker(
   "zoom-recording-processing",
@@ -45,13 +61,54 @@ const recordingWorker = new Worker(
       }
 
       // Upload files to S3 using streaming upload
-      console.log(`�� Starting S3 upload for session: ${sessionId}`);
-
-      const uploadResult = await batchStreamUpload(
-        files,
-        sessionId,
-        download_token
+      console.log(`🚀 Starting S3 upload for session: ${sessionId}`);
+      console.log(
+        `📁 Files to upload:`,
+        files.map((f) => ({
+          id: f.id,
+          type: f.recording_type,
+          size: f.file_size,
+        }))
       );
+      console.log(`🔑 Download token available:`, !!download_token);
+
+      let uploadResult;
+      try {
+        console.log(`🔄 Calling batchStreamUpload function...`);
+        uploadResult = await batchStreamUpload(
+          files,
+          sessionId,
+          download_token
+        );
+        console.log(`✅ batchStreamUpload completed successfully`);
+        console.log(`📊 S3 Upload Result:`, {
+          successfulUploads: uploadResult.successfulUploads.length,
+          failedUploads: uploadResult.failedUploads.length,
+          totalFiles: uploadResult.totalFiles,
+        });
+      } catch (uploadError) {
+        console.error(`❌ S3 Upload failed:`, uploadError.message);
+        console.error(`❌ S3 Upload error stack:`, uploadError.stack);
+
+        // Return error result
+        return {
+          sessionId,
+          accountId,
+          filesProcessed: 0,
+          failedFiles: files.length,
+          totalFiles: files.length,
+          successfulUploads: [],
+          failedUploads: files.map((file) => ({
+            fileId: file.id,
+            error: uploadError.message,
+          })),
+          totalSize: 0,
+          totalDuration: 0,
+          processingTime: new Date().toISOString(),
+          uploadError: uploadError.message,
+          s3UploadStatus: "FAILED",
+        };
+      }
 
       // Calculate summary statistics
       const totalSize = uploadResult.successfulUploads.reduce((sum, file) => {
@@ -70,31 +127,44 @@ const recordingWorker = new Worker(
         try {
           console.log(`💾 Updating database for session: ${sessionId}`);
 
-          // Find the meeting record
+          // Get the session_name from the webhook payload (this is the meeting ID)
+          const sessionName = payload?.object?.session_name;
+          console.log(`🔍 Looking for meeting with ID: ${sessionName}`);
+
+          // Find the meeting record by ID (session_name corresponds to meeting id)
           const meeting = await ZoomMeeting.findOne({
-            where: { sessionId: sessionId },
+            where: { id: sessionName },
           });
 
           if (meeting) {
             // Get the primary video recording URL (usually the first successful upload)
             const primaryVideo =
               uploadResult.successfulUploads.find(
-                (file) => file.recordingType === "video"
+                (file) =>
+                  file.recordingType === "shared_screen_with_speaker_view"
               ) || uploadResult.successfulUploads[0];
 
-            // Update only the existing recordingUrl column
+            // Update both sessionRecorded and recordingUrl columns
             await meeting.update({
+              sessionRecorded: "completed",
               recordingUrl: primaryVideo.s3Url,
             });
 
-            console.log(
-              `✅ Database updated with S3 URL: ${primaryVideo.s3Url}`
-            );
+            console.log(`✅ Database updated successfully!`);
+            console.log(`   - sessionRecorded: completed`);
+            console.log(`   - recordingUrl: ${primaryVideo.s3Url}`);
+            console.log(`   - Meeting ID: ${meeting.id}`);
           } else {
-            console.log(`⚠️ No meeting record found for session: ${sessionId}`);
+            console.log(
+              `⚠️ No meeting record found for session name: ${sessionName}`
+            );
+            console.log(
+              `🔍 Available meeting fields: id, mentorId, menteeId, etc.`
+            );
           }
         } catch (dbError) {
           console.error(`❌ Database update failed:`, dbError.message);
+          console.error(`❌ Database error stack:`, dbError.stack);
           // Don't fail the entire job if database update fails
         }
       }

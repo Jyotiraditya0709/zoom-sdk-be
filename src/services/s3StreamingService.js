@@ -1,4 +1,5 @@
 import axios from "axios";
+import { PutObjectCommand } from "@aws-sdk/client-s3";
 import {
   s3Client,
   bucketConfig,
@@ -23,6 +24,8 @@ export const streamUploadToS3 = async (
   fileType,
   downloadToken
 ) => {
+  const startTime = Date.now();
+
   try {
     console.log(
       `🚀 Starting streaming upload for session: ${sessionId}, file: ${fileName}`
@@ -31,67 +34,99 @@ export const streamUploadToS3 = async (
     // 1️⃣ Generate a safe, structured S3 key
     const s3Key = generateS3Key(sessionId, fileName, fileType);
 
-    // 2️⃣ Create upload parameters for S3
+    // 2️⃣ Handle different URL types (HTTP vs Data URLs)
+    let response, contentLength, fileSizeMB;
 
+    if (zoomDownloadUrl.startsWith("data:")) {
+      // Handle data URLs (for testing)
+      console.log(`📥 Processing data URL: ${fileName}`);
+      const base64Data = zoomDownloadUrl.split(",")[1];
+      const buffer = Buffer.from(base64Data, "base64");
+      contentLength = buffer.length;
+      fileSizeMB = (contentLength / 1024 / 1024).toFixed(2);
+      console.log(`📊 File size: ${fileSizeMB} MB`);
+
+      // Create a mock response object for data URLs
+      response = {
+        data: buffer,
+        headers: {
+          "content-length": contentLength.toString(),
+          "content-type": "application/octet-stream",
+        },
+        // Add methods that axios response would have
+        get: function (headerName) {
+          return this.headers[headerName.toLowerCase()];
+        },
+      };
+    } else {
+      // Handle HTTP URLs (real Zoom recordings)
+      console.log(`📥 Downloading from Zoom: ${fileName}`);
+      response = await axios({
+        method: "GET",
+        url: zoomDownloadUrl,
+        headers: {
+          Authorization: `Bearer ${downloadToken}`,
+          "User-Agent": "Zoom-Recording-Uploader/1.0",
+        },
+        responseType: "arraybuffer", // Changed from "stream" to "arraybuffer"
+        timeout: 300000,
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity,
+      });
+
+      contentLength = response.headers["content-length"];
+      fileSizeMB = contentLength
+        ? (contentLength / 1024 / 1024).toFixed(2)
+        : "unknown";
+      console.log(`📊 File size: ${fileSizeMB} MB`);
+    }
+
+    console.log(`⏱️ Download completed in ${Date.now() - startTime}ms`);
+
+    // 4️⃣ Create upload parameters for S3
     const uploadParams = {
-      Bucket: process.env.S3_BUCKET_NAME,
+      Bucket: bucketConfig.bucketName,
       Key: s3Key,
-      Body: null,
-      ContentType: getContentType(fileType),
+      Body: Buffer.from(response.data), // Convert arraybuffer to Buffer
+      ContentType: getContentType(fileName),
       Metadata: {
         "session-id": sessionId,
         "file-type": fileType,
         "original-name": fileName,
         "uploaded-at": new Date().toISOString(),
         source: "zoom-streaming-upload",
+        "file-size": contentLength || "unknown",
       },
     };
-    // 3️⃣ Create a stream from the Zoom file without storing it locally
-    const response = await axios({
-      method: "GET",
-      url: zoomDownloadUrl,
-      headers: {
-        Authorization: `Bearer ${downloadToken}`,
-        "User-Agent": "Zoom-Recording-Uploader/1.0",
-      },
-      responseType: "stream",
-      timeout: 300000,
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity,
-    });
 
-    uploadParams.Body = response.data;
-
-    // 4️⃣ Record file size in metadata
-    const contentLength = response.headers["content-length"];
-    if (contentLength) {
-      uploadParams.Metadata["file-size"] = contentLength;
+    // Add ContentLength only if it's available and valid
+    if (contentLength && contentLength > 0 && !isNaN(parseInt(contentLength))) {
+      uploadParams.ContentLength = parseInt(contentLength);
+    } else {
       console.log(
-        `📊 File size: ${(contentLength / 1024 / 1024).toFixed(2)} M`
+        `⚠️ Content-Length not available or invalid: ${contentLength}`
       );
     }
-    console.log(`📤 Uploading to S3: ${s3Key}`);
 
-    const upload = s3Client.upload(uploadParams, {
-      partSize: 10 * 1024 * 1024, // 10MB parts
-      queueSize: 4,
-      leavePartsOnError: false,
-    });
+    const uploadStartTime = Date.now();
+    console.log(`📤 Starting S3 upload: ${s3Key}`);
+    console.log(`📈 Upload progress: Starting...`);
 
-    // Optional: Log progress
-    upload.on("httpUploadProgress", (progress) => {
-      const percentage = Math.round((progress.loaded / progress.total) * 100);
-      console.log(
-        `📈 Upload progress: ${percentage}% (${progress.loaded}/${progress.total} bytes)`
-      );
-    });
+    // 5️⃣ Upload to S3 using AWS SDK v3
+    const command = new PutObjectCommand(uploadParams);
+    const result = await s3Client.send(command);
 
-    // 6️⃣ Wait for upload to complete
-    const result = await upload.promise();
-
+    const uploadDuration = Date.now() - uploadStartTime;
+    const totalDuration = Date.now() - startTime;
     const s3Url = getS3Url(s3Key);
 
     console.log(`✅ Upload completed for ${fileName}`);
+    console.log(`⏱️ Upload duration: ${uploadDuration}ms`);
+    console.log(`⏱️ Total processing time: ${totalDuration}ms`);
+    const uploadSpeed = contentLength
+      ? `${(fileSizeMB / (uploadDuration / 1000)).toFixed(2)} MB/s`
+      : "unknown";
+    console.log(`📊 Upload speed: ${uploadSpeed}`);
     console.log(`🔗 S3 URL: ${s3Url}`);
 
     return {
@@ -103,16 +138,23 @@ export const streamUploadToS3 = async (
       etag: result.ETag,
       fileSize: contentLength,
       uploadTime: new Date().toISOString(),
+      uploadDuration,
+      totalDuration,
+      uploadSpeed: uploadSpeed,
     };
   } catch (error) {
-    console.error(`❌ Upload failed for ${fileName}:`, error.message);
+    const totalDuration = Date.now() - startTime;
+    console.error(
+      `❌ Upload failed for ${fileName} after ${totalDuration}ms:`,
+      error.message
+    );
 
     // 🔍 Handle specific known error cases
-    if (error.code === "NetworkingError") {
+    if (error.name === "NetworkError") {
       throw new Error(`Network error during upload: ${error.message}`);
-    } else if (error.code === "NoSuchBucket") {
-      throw new Error(`S3 bucket not found: ${process.env.S3_BUCKET_NAME}`);
-    } else if (error.code === "AccessDenied") {
+    } else if (error.name === "NoSuchBucket") {
+      throw new Error(`S3 bucket not found: ${bucketConfig.bucketName}`);
+    } else if (error.name === "AccessDenied") {
       throw new Error("Access denied — check AWS credentials & bucket policy.");
     } else if (error.response?.status === 401) {
       throw new Error("Zoom download token expired or invalid.");
@@ -144,7 +186,7 @@ const getContentType = (fileName) => {
     txt: "text/plain",
     json: "application/json",
   };
-  return contentType[extension] || "application/octet-stream";
+  return contentTypes[extension] || "application/octet-stream";
 };
 
 //  Batch upload multiple Zoom files to S3
@@ -186,18 +228,39 @@ export const batchStreamUpload = async (files, sessionId, downloadToken) => {
   const failedUploads = [];
 
   results.forEach((res, index) => {
-    if (res.status === "fulfilled" && res.value.success) {
+    if (res.status === "fulfilled" && res.value && res.value.success) {
       successfulUploads.push(res.value);
     } else {
+      const error =
+        res.status === "rejected"
+          ? res.reason.message
+          : res.value && res.value.error
+            ? res.value.error
+            : "Unknown error";
       failedUploads.push({
         fileId: files[index].id,
-        error: res.status === "rejected" ? res.reason.message : res.value.error,
+        error: error,
       });
     }
   });
   console.log(
     `📊 Batch upload summary: ${successfulUploads.length} successful, ${failedUploads.length} failed`
   );
+
+  if (successfulUploads.length > 0) {
+    console.log(
+      `✅ Successful uploads:`,
+      successfulUploads.map((u) => ({
+        fileId: u.originalFileId,
+        s3Url: u.s3Url,
+        size: u.fileSize,
+      }))
+    );
+  }
+
+  if (failedUploads.length > 0) {
+    console.log(`❌ Failed uploads:`, failedUploads);
+  }
 
   return {
     successfulUploads,

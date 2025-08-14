@@ -1,22 +1,23 @@
-import AWS from "aws-sdk";
+import { S3Client } from "@aws-sdk/client-s3";
 import dotenv from "dotenv";
 
 dotenv.config();
 
 const s3Config = {
-  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-  region: process.env.REGION || "us-east-1",
-  signatureVersion: "v4",
+  region: process.env.AWS_REGION || "ap-south-1",
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  },
 };
 
 //s3 client instance
-const s3Client = new AWS.S3(s3Config);
+const s3Client = new S3Client(s3Config);
 
 const bucketConfig = {
-  bucketName: process.env.S3_BUCKET_NAME,
-  region: process.env.REGION || "us-east-1",
-  folderPrefix: process.env.S3_FOLDER_PREFIX || "mu-meet",
+  bucketName: process.env.S3_BUCKET_NAME || "zoomsdk-rec",
+  region: process.env.AWS_REGION || "ap-south-1",
+  folderPrefix: process.env.S3_FOLDER_PREFIX || "recordings/",
 };
 
 const generateS3Key = (sessionId, fileName, fileType) => {
